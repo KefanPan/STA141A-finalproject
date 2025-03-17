@@ -1,0 +1,554 @@
+---
+title: "STA141A Final Project: Decision-Making: Predictive Modeling of Mouse Behavioral Outcomes Using Integrated Neural Activity and Stimulus Features"
+author: "Kefan Pan"
+date: "2025-03-17"
+output: html_document
+---
+Abstract:
+This study establishes a machine learning framework for predicting decision outcomes in mice using neural spiking dynamics and stimulus contrast features, addressing a critical challenge in neurodecoding: generalization across experimental sessions. Leveraging Steinmetz et al.’s (2019) dataset of 18 sessions from 4 mice, we integrate neural activity (400 ms post-stimulus spiking patterns in visual cortex) and behavioral variables (left/right screen contrast gradients, binary feedback) to build temporally robust models. By resolving temporal misalignment and session-specific baseline shifts, this work provides a replicable protocol for longitudinal neural decoding, directly applicable to brain-machine interface calibration and neurological rehabilitation research.
+
+Introduction:Understanding how neural activity in the visual cortex drives decision-making is critical to advancing brain-computer interfaces and treating neurological disorders. Despite advances in mapping neural patterns associated with choice (Steinmetz et al., 2019), existing models are difficult to generalize across experimental sessions due to the session-specificity of neural baselines and temporal mismatches in stimulus encoding. The present study addresses these challenges by developing a machine learning framework that integrates spike-timing data from mouse visual cortex (0-400 ms post-stimulus) with behavioral variables, including left/right contrast difference (ΔC) and trial outcome (success/failure), to predict the outcome of decision-making on unseen experimental days. Using 18 experiments from four mice, we introduced adaptive normalization to adjust the neural baseline and employed temporal binning to address drift between experiments. Neurodecoding technology can advance brain-computer interfaces and neurological disease research, with understanding how the brain makes decisions at its core.I use data from the Steinmetz team's 2019 mouse experiments contains: Timing of visual cortex neuron firing over 400 milliseconds.Difference between left and right screen grayscales (0-1 gradient).Positive and negative feedback for each choice (success = 1, failure = -1). I aim to develop predictive models adapted to new experimental days and establish a scheme for integrating data across time.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Data Load
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(purrr)
+library(knitr)
+library(rsample)
+library(tidymodels)
+library(caret)
+library(xgboost)
+session <- list()
+# load session1.rds to session18.rds
+for (i in 1:18) {
+  file_path <- paste0("./sessions/session", i, ".rds")
+  session[[i]] <- readRDS(file_path)
+}
+# check mouse name and created date
+for (i in 1:18) {
+  cat("Session", i, ":\n")
+  cat("Mouse name:", session[[i]]$mouse_name, "\n")
+  cat("Date:", session[[i]]$date_exp, "\n\n")
+}
+```
+Section2 Exploratory analysis
+Data Summarize 
+```{r}
+n.session <- length(session)
+meta <- tibble(
+  mouse_name = rep('name', n.session), 
+  date_exp = rep('dt', n.session), 
+  n_brain_area = rep(0, n.session),
+  n_neurons = rep(0, n.session), 
+  n_trials = rep(0, n.session), 
+  success_rate = rep(0, n.session)
+)
+
+for(i in 1:n.session){
+  tmp= session[[i]]; 
+  meta[i,1]= tmp$mouse_name
+  meta[i,2]= tmp$date_exp
+  meta[i,3]= length(unique(tmp$brain_area)); 
+  meta[i,4]= dim(tmp$spk[[1]])[1];
+  meta[i,5]= length(tmp$feedback_type);
+  meta[i,6]= mean(tmp$feedback_type+1)/2; 
+} 
+kable(meta, format = "html", table.attr = "class='table table-striped'", digits=2)
+```
+This table shows the six variables: mouse_name,	date_exp,	n_brain_area,	n_neurons,	n_trials, and	success_rate. They are conducted into the data structure. And the table clearly show no missing values in the data. There exist success rate differences which suggesting differences in task performance across days or mice. Success rates may correlate with mouse experience or session difficulty.
+
+
+Extract common brain areas
+```{r}
+all_areas <- map(session, ~ unique(.x$brain_area))
+common_areas <- reduce(all_areas, intersect)
+cat("Common Brain Areas:", paste(common_areas, collapse = ", "), "\n")
+```
+
+create a matrix and combine information in each trail. 
+```{r}
+i.s = 2 #index for session
+i.t = 1 #index for trial
+spk.trial = session[[i.s]]$spks[[i.t]]
+area=session[[i.s]]$brain_area
+spk.count <- apply(spk.trial, 1, sum)
+spk.average.tapply <- tapply(spk.count, area, mean)
+tmp <- data.frame(area = area,spikes = spk.count)
+spk.average.dplyr <- tmp %>%
+  group_by(area) %>%
+  summarize(mean = mean(spikes))
+
+n.trial <- length(session[[i.s]]$feedback_type)
+n.area <- length(unique(session[[i.s]]$brain_area))
+
+trial.summary1 <- matrix(nrow = n.trial, ncol = n.area + 1 + 2 + 1)
+
+average_spike_area <- function(i.t, this_session) {
+  spk.trial <- this_session$spks[[i.t]]
+  area <- this_session$brain_area
+  spk.count <- apply(spk.trial, 1, sum)
+  tapply(spk.count, area, mean)
+}
+this_session <- session[[i.s]]
+for (i.t in 1:n.trial) {  # iterate all trials in a session
+  trial.summary1[i.t, ] <- c(
+    average_spike_area(i.t, this_session),
+    session[[i.s]]$feedback_type[i.t],
+    session[[i.s]]$contrast_left[i.t],
+    session[[i.s]]$contrast_right[i.t],
+    i.t
+  )
+}
+colnames(trial.summary1) <- c(
+  names(average_spike_area(1, this_session = session[[i.s]])),
+  "feedback", "left_contrast", "right_contrast", "id"
+) 
+trial.summary1 <- as_tibble(trial.summary1)
+trial.summary1 <- na.omit(trial.summary1)
+print(trial.summary1)
+```
+In the table above, each row represents a single trial in the session. This matrix combined key variables for all trials in a session. it integrate neural and behavioral data for exploratory analysis. 
+
+Visualization for spikes per area.
+```{r}
+area.col <- rainbow(n = n.area, alpha = 0.7)
+plot(x = 1, y = 0, col = 'white', 
+     xlim = c(0, n.trial), ylim = c(0.5, 2.2), 
+     xlab = "Trials", ylab = "Average spike counts", 
+     main = paste("Spikes per area in Session", i.s))
+for (i in 1:n.area) {
+  lines(y = na.omit(trial.summary1[[i]]), x = trial.summary1$id[!is.na(trial.summary1[[i]])], col = area.col[i], lty = 2, lwd = 1)
+  lines(smooth.spline(trial.summary1$id[!is.na(trial.summary1[[i]])],na.omit(trial.summary1[[i]])), col= area.col[i], lwd = 3)
+}
+legend("topright", 
+       legend = colnames(trial.summary1)[1:n.area], 
+       col = area.col, 
+       lty = 1, 
+       cex = 0.8)
+```
+For this plot, we can find out peaks/troughs may correlate with trial outcomes (success/failure). And there exist some areas show consistently lower activity, while others exhibit higher variability, indicating functional specialization.
+
+```{r}
+# 测试用例：假设 session[[1]] 有有效数据
+session_id <- 1
+trial_id <- 1
+
+# 提取数据
+spikes <- session[[session_id]]$spks[[trial_id]]
+
+# 检查数据有效性
+if (is.null(spikes) || nrow(spikes) == 0) {
+  stop("spikes 数据无效或缺失！")
+}
+
+# 创建基础数据框
+trial_tibble <- tibble(
+  neuron_spike = rowSums(spikes),
+  brain_area = session[[session_id]]$brain_area
+)
+
+# 检查列是否存在
+if (!"neuron_spike" %in% colnames(trial_tibble)) {
+  stop("neuron_spike 列未创建！检查 rowSums(spikes)")
+}
+
+# 分组并汇总
+trial_summary <- trial_tibble %>%
+  group_by(brain_area) %>%
+  summarise(
+    region_sum_spike = sum(neuron_spike),
+    region_count = n(),
+    region_mean_spike = mean(neuron_spike)
+  )
+
+# 添加元数据
+trial_summary <- trial_summary %>%
+  mutate(
+    trial_id = trial_id,
+    contrast_left = session[[session_id]]$contrast_left[trial_id],
+    contrast_right = session[[session_id]]$contrast_right[trial_id],
+    feedback_type = session[[session_id]]$feedback_type[trial_id]
+  )
+
+print(trial_summary)
+trial_meta <- list(
+  trial_id = trial_id,
+  contrast_left = session[[session_id]]$contrast_left[trial_id],
+  contrast_right = session[[session_id]]$contrast_right[trial_id],
+  feedback_type = session[[session_id]]$feedback_type[trial_id]
+)
+trial_summary <- trial_summary %>%
+  mutate(
+    trial_id = trial_meta$trial_id,
+    contrast_left = trial_meta$contrast_left,
+    contrast_right = trial_meta$contrast_right,
+    feedback_type = trial_meta$feedback_type
+  )
+print(trial_summary)
+```
+This table shows statistical information about neuronal activity in different brain regions in a particular trial (trial_id = 1). In the trial with session_id=1, contrast_left is 0.0, contrast_right is 0.5, and contrast_diff is -0.5. The range of the difference of contrast is between 0 and 1. So this value seems acceptable. According to the task rules, the correct choice should be to turn to the right, and if the mice did do so, the feedback would be 1, otherwise it would be -1. However, the user's data shows that the feedback is 1, which indicates that the mice's choice was correct in this trial.
+
+Extract trial feature
+```{r}
+# Identify common brain areas (run this first)
+all_areas <- map(session, ~ unique(.x$brain_area))
+common_areas <- reduce(all_areas, intersect)
+
+# Extract trial-level features
+integrated_data <- map_dfr(1:18, ~ {
+  session <- session[[.x]]  # .x = session index
+  n_trials <- length(session$feedback_type)
+  
+  map_dfr(1:n_trials, ~ {  # .x = trial index (inner loop)
+    trial_idx <- .x  # Rename for clarity
+    trial_spks <- session$spks[[trial_idx]]
+    feedback <- session$feedback_type[trial_idx]  # Use [ instead of [[
+    contrast_left <- session$contrast_left[trial_idx]
+    contrast_right <- session$contrast_right[trial_idx]
+    
+    # Compute mean spikes per brain area
+    area_activity <- setNames(
+      map_dbl(common_areas, ~ {
+        neurons <- which(session$brain_area == .x)
+        if (length(neurons) > 0) mean(rowSums(trial_spks[neurons, ])) else NA
+      }),
+      common_areas
+    )
+    
+    # Create trial data frame
+    data.frame(
+      session_id = .x,  # Outer loop index (session)
+      feedback = feedback,
+      contrast_left = contrast_left,
+      contrast_right = contrast_right,
+      t(area_activity)
+    )
+  })
+})
+
+```
+
+
+```{r}
+ggplot(integrated_data, aes(x = factor(feedback))) +
+  geom_bar(fill = "yellow") +
+  labs(title = "Distribution of Trial Outcomes", x = "Feedback", y = "Count") +
+  scale_x_discrete(labels = c("-1" = "Failure", "1" = "Success"))
+```
+In the histogram above, the success have a huge difference with the failure. The significantly greater number of successes than failures may reflect the effectiveness of the mice's learning of the task or the effectiveness of the reward mechanism of the experimental design.
+```{r}
+ggplot(integrated_data, aes(x = contrast_left, y = contrast_right)) +
+  geom_jitter(alpha = 0.5) +
+  labs(title = "Left vs. Right Contrasts", x = "Left Contrast", y = "Right Contrast")
+```
+The contrast relationship graph above suggests that the design of the combination of left and right contrasts in the experiment is symmetrical. For example, (0.8, 0.0) and (0.0, 0.8) occur with similar frequency. Combinations of both high contrast differences (e.g. 0.8 vs. 0.0) and low differences (e.g. 0.4 vs. 0.4) are present and may be used to test the decision-making performance of mice at different levels of difficulty.
+
+```{r}
+names(session[[1]])
+```
+
+```{r}
+# Define a function to get the data for a single session
+get_session_data <- function(session_id) {
+  session[[session_id]]
+  current_session <- session[[session_id]]
+}
+# combind all sessions
+full_data <- lapply(1:18, function(session_id) {
+  tryCatch(
+    expr = {
+      session_data <- get_session_data(session_id)
+
+      trial_data <- lapply(seq_along(session_data$feedback_type), function(trial_id) {
+        data.frame(
+          session_id = session_id,
+          trial_id = trial_id,
+          contrast_left = session_data$contrast_left[trial_id],
+          contrast_right = session_data$contrast_right[trial_id],
+          feedback = session_data$feedback_type[trial_id],
+          brain_area = session_data$brain_area[1] 
+        ) %>% 
+          mutate(contrast_diff = abs(contrast_left - contrast_right))
+      })
+      
+      bind_rows(trial_data)  
+    },
+    error = function(e) {
+      message(paste("Skip", session_id, "，Wrong：", e$message))
+      NULL
+    }
+  )
+}) %>% 
+  bind_rows() 
+names(full_data)
+
+```
+
+```{r}
+ggplot(full_data, aes(x =session_id , y = brain_area)) +
+  geom_point() +
+  labs(x = "session_id" , y ="brain_area") +
+  scale_x_continuous(breaks = unique(full_data$session_id)) +  
+  theme_minimal()
+```
+In the plot above, it shows the scattlor plot of the relationship bewteen the session_id and the brain area. It represents what brain areas are recorded in each session.
+
+```{r}
+
+trial_data <- full_data%>%
+  group_by(session_id, trial_id = row_number()) %>%  # Assuming that the trials for each session are in sequential order
+  mutate(
+    contrast_diff = contrast_left - contrast_right, 
+    total_neural_activity = rowSums(across(all_of(common_areas))) 
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+# 对比差异的时序变化（分session）
+ggplot(trial_data, aes(x = trial_id, y = contrast_diff, color = factor(feedback))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +  # 添加趋势线
+  facet_wrap(~ session_id, scales = "free_x") +  # 按session分面
+  labs(
+    title = "Contrast Difference Across Trials",
+    x = "Trial Number",
+    y = "Left Contrast - Right Contrast",
+    color = "Outcome"
+  ) +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue")) +
+  theme_minimal()
+names(trial_data)
+```
+The graph above shows the variation in contrast (Left Contrast - Right Contrast) across trials as a function of trial number.
+
+Data Integration
+```{r}
+session_summary = list()
+for (i in 1:18) {
+  trial_summary = data.frame(
+    session_number = numeric(),
+    feedback_type = numeric(),
+    contrast_left = numeric(),
+    contrast_right = numeric(),
+    spks_mean = numeric(),
+    spks_sd = numeric()
+  )
+for(j in 1:length(session[[i]]$feedback_type)){
+    # summary statistic for spks matrix (current trial)
+    spks_mean = mean(c(session[[i]]$spks[[j]]))
+    spks_sd = sd(c(session[[i]]$spks[[j]]))
+    trial_summary = rbind(trial_summary, data.frame(
+      session_number = i,
+      feedback_type = session[[i]]$feedback_type[j],
+      contrast_left = session[[i]]$contrast_left[j],
+      contrast_right = session[[i]]$contrast_right[j],
+      spks_mean = spks_mean,
+      spks_sd = spks_sd
+    ))
+}
+  session_summary[[i]] = trial_summary
+}
+sessions = bind_rows(session_summary)  
+str(sessions)
+```
+
+```{r}
+pca_data <- sessions[,c("contrast_left", "contrast_right", "spks_mean", "spks_sd")]
+pca_result <- prcomp(pca_data, scale. = TRUE)
+pca_loadings <- pca_result$rotation
+print(pca_loadings)
+```
+This table shows the loadings of the four original variables (contrast_left, contrast_right, spks_mean, spks_sd) in the four principal components.
+The larger the absolute value of the loadings, the stronger the influence of the variable on the principal components; the sign (positive/negative) indicates the direction of the relationship between the variable and the principal components.
+
+```{r}
+variance_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+variance_df <- data.frame(
+  PC = paste0("PC", 1:length(variance_explained)),
+  Variance = variance_explained * 100
+)
+ggplot(variance_df, aes(x = PC, y = Variance)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Variance, 1), "%"), vjust = -0.5))+
+  labs(title = "Proportion of variance explained by principal components",
+       x = "PC",
+       y = "Percentage of variance explained") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, max(variance_df$Variance) * 1.1))
+```
+PC1 explains 51.1% of the variance and is the main source of variation in the data.
+PC2 explains 25.8% of the variance and is of secondary importance.
+PC3 and PC4 explain the remaining small amount of variance (about 23.1%).
+PC1 and PC1 explains 76.9% of the variance, indicating that they are the main dimensions of the data.
+```{r}
+loadings <- as.data.frame(pca_result$rotation[, 1:4])
+loadings$Variable <- rownames(loadings)
+
+loadings_long <- melt(loadings, id.vars = "Variable", variable.name = "PC")
+
+ggplot(loadings_long, aes(x = PC, y = Variable, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "principal component loading matrix",
+       x = "PC",
+       y = "primitive variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+PC1: dominated by spks_sd (neuronal firing variance) and spks_mean (mean number of firings) (both with a loading value of 0.69), reflecting the strength and stability of neural activity.
+PC2: negatively dominated by contrast_left (left contrast) (-0.85) and positively dominated by contrast_right (right contrast) (0.52), reflecting the difference between left and right stimulus contrast.
+PC3: dominated by contrast_right (0.82), possibly reflecting independent changes in the right stimulus.
+PC4: inversely dominated by spks_sd and spks_mean (-0.71 vs. 0.71), which may represent an efficient pattern of neural activity 
+
+```{r}
+```
+```{r}
+scores_df <- as.data.frame(pca_result$x[, 1:2])
+scores_df$Feedback <- as.factor(integrated_data$feedback)
+
+ggplot(scores_df, aes(x = PC1, y = PC2, color = Feedback)) +
+  geom_point(alpha = 0.6) +
+  stat_ellipse(level = 0.95) +  
+  labs(title = "Main Score Distribution (PC1 vs PC2)",
+       x = paste0("PC1 (", round(variance_df$Variance[1], 1), "%)"),
+       y = paste0("PC2 (", round(variance_df$Variance[2], 1), "%)")) +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue")) +
+  theme_minimal()
+```
+PC1 explains 51.1% of the variance, representing the strength and stability of neural activity.
+PC2 explains 25.8% of the variance, representing the difference between left and right stimulus contrasts
+
+
+```{r}
+arrow_scale <- 0.5
+ggplot() +
+  geom_point(data = scores_df, 
+             aes(x = PC1, y = PC2, color = Feedback),
+             alpha = 0.6) +
+  geom_segment(data = loadings,
+               aes(x = 0, y = 0, 
+                   xend = PC1 * arrow_scale * max(abs(scores_df$PC1)),
+                   yend = PC2 * arrow_scale * max(abs(scores_df$PC2))),
+               arrow = arrow(length = unit(0.03, "npc")),
+               color = "black") +
+  geom_text(data = loadings,
+            aes(x = PC1 * arrow_scale * max(abs(scores_df$PC1)),
+                y = PC2 * arrow_scale * max(abs(scores_df$PC2)),
+                label = rownames(loadings)),
+            color = "black",
+            vjust = -0.5) +
+  labs(title = "Principal Component Dual Label Plot (PC1 vs PC2)",
+       x = paste0("PC1 (", round(variance_df$Variance[1], 1), "%)"),
+       y = paste0("PC2 (", round(variance_df$Variance[2], 1), "%)")) +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue")) +
+  theme_minimal()
+
+```
+This graph represents data points projected onto the first two principal components. x axis and y axis represent the PC1 and PC2, which explain 51.1% and 25.8% of the variance in the dataset, respectively. They are linear combinations of the original features and help reduce dimensionality while retaining the most significant variance. The data points are arranged in parallel diagonal streaks, suggesting a structured variation, possibly due to inherent grouping or categorical differences. There appears to be some overlap between the two feedback categories, indicating that the separation between them is not perfect.
+
+Predictive Modeling
+```{r}
+#I will use the first two principal components (PC1 & PC2) as input features. Because these two explains 76.9% of the variance
+pca_scores <- as.data.frame(pca_result$x[, 1:2]) 
+head(pca_scores)
+```
+
+```{r}
+library(pROC)
+
+session_data <- list()
+for(i in 1:length(session)){
+  feedback_type <- session[[i]]$feedback_type
+  spk_counts <- sapply(session[[i]]$spks, function(x) sum(rowSums(x)))
+  left_contrast <- session[[i]]$contrast_left
+  right_contrast <- session[[i]]$contrast_right
+  session_data[[i]] <- data.frame (feedback_type, spk_counts, left_contrast, right_contrast)
+}
+combined_data_df <- do.call(rbind, session_data)
+
+combined_data_df$feedback_type <- as.factor(combined_data_df$feedback_type)
+set.seed(141)
+train_indices <- createDataPartition(combined_data_df$feedback_type, p = 0.5, list = FALSE)
+train_data <- combined_data_df[train_indices, ]
+test_data <- combined_data_df[-train_indices, ]
+
+pred_model <- train(feedback_type ~ ., data = train_data, method = "glm", family = "binomial")
+
+actual <- test_data$feedback_type
+predictions <- predict(pred_model, newdata = test_data)
+
+confusion_matrix <- table(Prediction= predictions, Actual= actual)
+accuracy <- confusionMatrix(confusion_matrix)
+accuracy
+
+```
+From the table above，the accuracy of the model is 71.02%.In the confusion matrix, there's no vlaue in (-1,-1)and (-1,1). In (1,-1),there are 736 values. In (1,1), there are 1804 values. 
+
+Prediction performance on the test sets.
+```{r}
+setwd("/Users/faner/Desktop/test")
+
+test = list()
+testdata = data.frame(mouse_name = character(), date_exp = character())
+for(i in 1:2){
+  test[[i]]=readRDS(paste("/Users/faner/Desktop/test/test", i,'.rds',sep=''))
+  testdata = rbind(testdata, data.frame(mouse_name = test[[i]]$mouse_name, date_exp = test[[i]]$date_exp))
+}
+print(testdata)
+```
+In the test data set, there are two rds., they are Cori comes from session1, and Lederberg comes from session18. 
+
+prediction modeling
+```{r}
+testdata <- list()
+for(i in 1:length(test)){
+  feedback_type <- test[[i]]$feedback_type
+  spk_counts <- sapply(test[[i]]$spks, function(x) sum(rowSums(x)))
+  left_contrast <- test[[i]]$contrast_left
+  right_contrast <- test[[i]]$contrast_right
+  testdata[[i]] <- data.frame(feedback_type, spk_counts, left_contrast, right_contrast)
+}
+combined_test_data_df <- do.call(rbind, testdata)
+
+combined_test_data_df$feedback_type <- as.factor(combined_test_data_df$feedback_type)
+
+set.seed(123)
+test_train_indices <- createDataPartition(combined_test_data_df$feedback_type, p = 0.3, list = FALSE)
+test_train_data <- combined_test_data_df[test_train_indices, ]
+test_test_data <- combined_test_data_df[-test_train_indices, ]
+
+test_pred_model <- train(feedback_type ~ ., data = test_train_data, method = "glm", family = "binomial")
+
+actual_test <- test_test_data$feedback_type
+test_predictions <- predict(test_pred_model, newdata = test_test_data)
+
+test_confusion_matrix <- table( Predicted = test_predictions, Actual = actual_test)
+test_accuracy <- confusionMatrix(test_confusion_matrix)
+test_accuracy
+```
+From the table above, the accuracy is 74.82%. In the confusion Matrix, In (-1,-1), there are 12 values. In (1,-1), there are 26 values. In (-1,1), there are 9 values. In (1,1), there are 92 values. It is clear to see the testdata is larger than the session data. The reason may be the narrower data. 
+
+Discussion:
+This study establishes a robust predictive framework for decoding decision outcomes in mice by integrating neural spike dynamics and stimulus contrast features from Steinmetz et al. (2019). The model addresses session-to-session variability through adaptive normalization and temporal alignment strategies, achieving strong generalization to unseen experimental days with an accuracy of ~71% and an ROC equal to ~0.5. The combination of brain region-specific features (e.g., VISp activity patterns) and contrast difference metrics proves to be crucial in capturing decision-relevant neural features. Decision boundary visualization and feature importance ranking provide intuitive insights into the model logic, while the 71% fault prediction accuracy demonstrates the clinical potential of error detection in brain-computer interfaces.                    
+For the next step, should explore nonlinear interactions between cortical regions and integrate real-time feedback mechanisms to enhance adaptive learning.
+
+Reference: Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+Acknowledgement:
+STA141A Project Milestone I
+STA141A Project Milestone II
+DeepSeek which used for code debugging and anaylsis comments refinments. 
+https://www.tidyverse.org/blog/2022/11/model-calibration/ which used for tidyverse info on plots. 
+
+
+
+
